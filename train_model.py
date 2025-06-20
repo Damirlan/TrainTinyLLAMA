@@ -10,20 +10,22 @@ from transformers import (
 )
 from datasets import Dataset
 
-# Чтобы уменьшить фрагментацию памяти CUDA (опционально)
+# Расширение управления CUDA-памятью (опционально, но полезно)
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-# 1. Загружаем данные
+# 1. Загрузка данных
 print("Загрузка CSV...")
-df = pd.read_csv("reviews_with_replies.csv", encoding='utf-8')
+df = pd.read_csv("reviews_with_replies.csv", encoding="utf-8")
 print(f"Данные загружены: {len(df)} записей")
 
-# 2. Форматируем примеры
+# 2. Форматирование примеров
 def format_example(example):
-    prompt = (f"Рейтинг: {example['rating']}\n"
-              f"Товар: {example['product_name']}\n"
-              f"Отзыв: {example['review_text']}\n"
-              "Ответ:")
+    prompt = (
+        f"Рейтинг: {example['rating']}\n"
+        f"Товар: {example['product_name']}\n"
+        f"Отзыв: {example['review_text']}\n"
+        "Ответ:"
+    )
     completion = example['reply']
     return {"text": prompt + " " + completion}
 
@@ -34,52 +36,57 @@ print(f"Пример форматированного текста:\n{texts_for_
 
 dataset = Dataset.from_dict({"text": texts_for_dataset})
 
-# 3. Загружаем токенизатор и модель
+# 3. Определение устройства и dtype
+use_gpu = torch.cuda.is_available()
+device_map = "auto" if use_gpu else None
+torch_dtype = torch.float16 if use_gpu else torch.float32
+print(f"Используемое устройство: {'GPU' if use_gpu else 'CPU'}")
+
+# 4. Загрузка токенизатора и модели
 model_name = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 print("Загружаем токенизатор и модель...")
 tokenizer = LlamaTokenizer.from_pretrained(model_name)
 
 model = LlamaForCausalLM.from_pretrained(
     model_name,
-    device_map="auto",
-    offload_folder="offload",       # offload части модели на диск
-    offload_state_dict=True,        # выгрузка состояния оптимизатора
-    torch_dtype=torch.float16       # 16-битная точность (fp16)
+    device_map=device_map,
+    torch_dtype=torch_dtype,
+    offload_folder="offload" if use_gpu else None,
+    offload_state_dict=use_gpu,
 )
 
-# Включаем gradient checkpointing для экономии памяти
+# Включаем gradient checkpointing (экономия памяти)
 model.gradient_checkpointing_enable()
 
-# 4. Токенизируем
+# 5. Токенизация
 print("Токенизируем данные...")
 def tokenize_function(examples):
     return tokenizer(examples["text"], truncation=True, max_length=512)
 
 tokenized_datasets = dataset.map(tokenize_function, batched=True, remove_columns=["text"])
-
 print(f"Пример токенизированных данных:\n{tokenized_datasets[0]}")
 
-# 5. Data collator
+# 6. Data collator
 data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
-# 6. Настройки тренировки
+# 7. Параметры тренировки
 training_args = TrainingArguments(
     output_dir="./tinyllama-finetuned",
     overwrite_output_dir=True,
     num_train_epochs=3,
-    per_device_train_batch_size=1,  # Уменьшаем batch size из-за ограничений памяти
+    per_device_train_batch_size=4,
     save_steps=500,
     save_total_limit=2,
     logging_steps=50,
     learning_rate=5e-5,
     weight_decay=0.01,
     warmup_steps=100,
-    fp16=False,                    # GTX 1660 не стабильно работает с fp16 через AMP, поэтому False
+    bf16=True,  # ✅ A5000 поддерживает bfloat16
     report_to="none",
     load_best_model_at_end=False,
+    logging_dir="./logs",
 )
-
-# 7. Trainer
+# 8. Trainer
 trainer = Trainer(
     model=model,
     args=training_args,
@@ -87,12 +94,13 @@ trainer = Trainer(
     data_collator=data_collator,
 )
 
-print("🚀 Начинаем обучение на GPU...")
+print("🚀 Начинаем обучение...")
 trainer.train()
-print("Обучение завершено.")
+print("✅ Обучение завершено.")
 
-# 8. Сохраняем модель
-print("Сохраняем модель...")
+# 9. Сохраняем модель и токенизатор
+print("💾 Сохраняем модель...")
 trainer.save_model("./tinyllama-finetuned")
 tokenizer.save_pretrained("./tinyllama-finetuned")
-print("Модель сохранена.")
+print("✅ Модель и токенизатор сохранены.")
+
